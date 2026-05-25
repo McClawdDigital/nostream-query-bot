@@ -1,0 +1,265 @@
+{
+  "name": "Nostr Query Bot",
+  "tags": [
+    "nostr",
+    "bigquery",
+    "gemini",
+    "llm",
+    "bot"
+  ],
+  "nodes": [
+    {
+      "id": "webhook-trigger",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "nostr-query",
+      "path": "nostr-query",
+      "responseMode": "onReceived",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "nostr-query",
+        "options": {}
+      }
+    },
+    {
+      "id": "extract-fields",
+      "name": "Extract Fields",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Extract query, pubkey, eventId from webhook payload\nconst body = $input.first().json.body || $input.first().json;\nreturn [\n  {\n    json: {\n      query: body.query || body.content || '',\n      pubkey: body.pubkey || '',\n      eventId: body.eventId || ''\n    }\n  }\n];"
+      }
+    },
+    {
+      "id": "set-gemini-prompt",
+      "name": "Build Gemini Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Load table schema context (set as env var or static data in prod)\n// For MVP, inline the schema context here or read from a file\nconst SCHEMA = `You are a SQL assistant for a Google BigQuery Nostr dataset.\n\nAvailable tables:\n\n---\nTable: events\nDataset: Nostr\nRow count: ~2.78 billion (278 GB)\nPartitioned by: created_at\nClustered by: kind\n\nColumns:\n- id (STRING): Event ID, hex, 64 chars\n- pubkey (STRING): Author public key, hex, 64 chars\n- created_at (TIMESTAMP): Event time UTC\n- kind (INTEGER): Event kind. Key values: 0=metadata, 1=text note, 3=contacts, 4=DM, 5=delete, 6=repost, 7=reaction, 9735=zap receipt\n- tags (ARRAY<STRUCT<STRING, STRING>>): Nostr tags array\n- content (STRING): Event body text\n- sig (STRING): Schnorr signature\n\nTable: flat_events (if present)\nDerived table with parsed reply_to and mentions.\n- event_id, author_pubkey, event_kind, created_at, event_content, reply_to_event_id, mentions\n\nQuery rules:\n1. Use fully qualified names: replit-gcp.Nostr.events\n2. Always include WHERE created_at >= TIMESTAMP('YYYY-MM-DD') to avoid full scans\n3. Use COUNT(*), COUNT(DISTINCT ...), TIMESTAMP_TRUNC(...) for aggregations\n4. Text search: LOWER(content) LIKE '%term%'\n5. Return only the SQL, wrapped in markdown code fence. No explanation.\n---\n\nUser asked: \"${$input.first().json.query}\"\n\nReturn only the SQL query inside triple backticks.`;\n\nreturn [{\n  json: {\n    prompt: SCHEMA\n  }\n}];"
+      }
+    },
+    {
+      "id": "call-gemini",
+      "name": "Gemini Generate SQL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        780,
+        0
+      ],
+      "parameters": {
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+        "method": "POST",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "key",
+              "value": "={{ $credentials.geminiApiKey ? $credentials.geminiApiKey.apiKey : 'YOUR_API_KEY_HERE' }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "contents",
+              "value": "=[{\"parts\":[{\"text\":\"{{ $input.first().json.prompt }}\"}]}]"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "credentials": {
+          "geminiApiKey": {}
+        }
+      }
+    },
+    {
+      "id": "parse-sql",
+      "name": "Parse SQL from Gemini",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Extract SQL from Gemini response\nconst geminiResponse = $input.first().json;\nlet sql = '';\ntry {\n  const text = geminiResponse.candidates?.[0]?.content?.parts?.[0]?.text || geminiResponse.text || '';\n  // Look for SQL inside triple backticks\n  const match = text.match(/```(?:sql)?\\s*\\n?([\\s\\S]*?)```/);\n  if (match) {\n    sql = match[1].trim();\n  } else {\n    // Fallback: if no code fences, use the whole response\n    sql = text.trim();\n  }\n} catch (e) {\n  sql = '';\n}\n\nif (!sql) {\n  throw new Error('Gemini did not return valid SQL: ' + JSON.stringify(geminiResponse).slice(0, 500));\n}\n\n// Safety: replace backticks inside SQL to prevent injection\nsql = sql.replace(/`/g, '');\n\nreturn [{\n  json: {\n    sql: sql\n  }\n}];"
+      }
+    },
+    {
+      "id": "run-bigquery",
+      "name": "Run BigQuery Job",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1300,
+        0
+      ],
+      "parameters": {
+        "url": "=https://bigquery.googleapis.com/bigquery/v2/projects/{{ $env.BQ_PROJECT_ID }}/queries",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "query",
+              "value": "={{ $input.first().json.sql }}"
+            },
+            {
+              "name": "useLegacySql",
+              "value": "=false"
+            },
+            {
+              "name": "maxResults",
+              "value": "=50"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleBigQueryOAuth2Api": {}
+      }
+    },
+    {
+      "id": "format-reply",
+      "name": "Format Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Format BigQuery result as a Nostr DM reply\nconst bqResult = $input.first().json;\nconst userPubkey = $items('Extract Fields')[0].json.pubkey;\n\nlet replyText = '';\ntry {\n  if (bqResult.rows && bqResult.rows.length > 0) {\n    const headers = bqResult.schema.fields.map(f => f.name);\n    const rows = bqResult.rows.map(row => {\n      const values = headers.map((h, i) => row.f[i].v);\n      return headers.map((h, i) => `${h}: ${values[i]}`).join(', ');\n    });\n    replyText = rows.join('\\n');\n    if (replyText.length > 2000) {\n      replyText = replyText.slice(0, 1900) + '\\n... (result truncated)';\n    }\n  } else if (bqResult.totalRows === '0') {\n    replyText = 'No rows returned.';\n  } else {\n    replyText = JSON.stringify(bqResult, null, 2).slice(0, 1500);\n  }\n} catch (e) {\n  replyText = 'Error formatting result: ' + e.message;\n}\n\nreturn [{\n  json: {\n    content: `Query result:\n${replyText}`,\n    toPubkey: userPubkey\n  }\n}];"
+      }
+    },
+    {
+      "id": "publish-to-bridge",
+      "name": "Publish to Bridge",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1820,
+        0
+      ],
+      "parameters": {
+        "url": "={{ $env.BRIDGE_PUBLISH_URL || 'http://localhost:3000/publish' }}",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "json",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "content",
+              "value": "={{ $input.first().json.content }}"
+            },
+            {
+              "name": "toPubkey",
+              "value": "={{ $input.first().json.toPubkey }}"
+            }
+          ]
+        },
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Fields": {
+      "main": [
+        [
+          {
+            "node": "Build Gemini Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Gemini Prompt": {
+      "main": [
+        [
+          {
+            "node": "Gemini Generate SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Generate SQL": {
+      "main": [
+        [
+          {
+            "node": "Parse SQL from Gemini",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse SQL from Gemini": {
+      "main": [
+        [
+          {
+            "node": "Run BigQuery Job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run BigQuery Job": {
+      "main": [
+        [
+          {
+            "node": "Format Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Reply": {
+      "main": [
+        [
+          {
+            "node": "Publish to Bridge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
