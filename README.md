@@ -1,199 +1,195 @@
 # Nostream Query Bot
 
-n8n-powered Nostr bot that accepts lightning zaps (fixed price: 10,000 sats) and answers natural-language questions about your BigQuery Nostr dataset.
+A lightweight Nostr bot that lets users pay 10,000 sats (via Lightning zap) to ask plain-language questions about the Nostream BigQuery dataset, and get an answer back — all through Nostr.
 
-**Status:** MVP — bridge + n8n workflow. No custom UI yet.
+**Status:** Validation MVP. Zero infrastructure overhead.
 
 ---
 
 ## How It Works (30-Second Version)
 
-1. User sends a 10,000 sat zap to the bot's Nostr pubkey
-2. User DMs the bot a plain-language question: *"How many notes were created last week?"*
-3. A lightweight **Nostr Bridge** forwards the DM to an n8n webhook
-4. **n8n workflow**: Gemini translates the question → BigQuery SQL → executes → formats reply
-5. n8n calls the bridge `/publish` endpoint to send the answer back as a Nostr DM
+1. **User zaps the bot 10,000 sats** on any Nostr client (Damus, Amethyst, Primal, etc.)
+2. **User DMs the bot** a plain-language question like *"How many notes were posted last week?"*
+3. A **Cloudflare Worker** (scheduled every 2 minutes) polls public Nostr relays, decrypts the DM, checks for zap credit, and forwards the question to **n8n**
+4. **n8n**: Gemini turns the question → BigQuery SQL → runs the query → formats the result
+5. **n8n POSTs the answer** back to the Worker's `/publish` endpoint, which encrypts and delivers a DM reply to the user
+
+That's it. Zero servers, zero relay setup, zero maintenance. You only need:
+- A Cloudflare account (free)
+- An n8n instance (cloud or self-hosted)
+- A Google AI Studio API key (free tier) and BigQuery access
 
 ---
 
 ## Architecture
 
 ```
-User (Nostr Client)
-   │ zap 10k sats + DM query
-   ▼
 ┌─────────────────┐     ┌──────────────────┐
-│  Nostr Relay(s) │────▶│  Nostr Bridge    │
-│  (e.g. Nostream)│     │  Node.js service │
-└─────────────────┘     └──────────────────┘
-                               │  POST to n8n webhook
-                               ▼
-                        ┌──────────────────┐
-                        │   n8n Workflow   │
-                        │ ─ Gemini NL→SQL │
-                        │ ─ BigQuery exec  │
-                        │ ─ Format reply   │
-                        └──────────────────┘
-                               │ POST to bridge /publish
-                               ▼
-                        ┌──────────────────┐
-                        │  Nostr Bridge    │──▶ Relay(s)
-                        │  Signs + sends   │──▶ User DM reply
-                        └──────────────────┘
+│  User (Nostr)   │     │  Cloudflare Worker   │
+│  Client ────────────────▶│                     │
+└─────────────────┘     │  ─ Cron poll         │
+                         │  ─ NIP-04 decrypt    │
+                         │  ─ Check zap credit  │
+                         │  ─ POST to n8n       │
+                         └──────────────────┘
+                                  │
+                                  ▼
+                         ┌──────────────────┐
+                         │   n8n Workflow    │
+                         │ ─ Gemini NL→SQL    │
+                         │ ─ BigQuery exec    │
+                         │ ─ Format reply     │
+                         └──────────────────┘
+                                  │
+                                  ▼
+                         ┌──────────────────┐
+                         │  Cloudflare Worker   │──▶ Relay(s)
+                         │  POST /publish ─────│──▶ User DM reply
+                         │  ─ NIP-04 encrypt   │
+                         └──────────────────┘
 ```
 
----
-
-## Prerequisites
-
-| Component | What You Need |
-|-----------|---------------|
-| n8n | Self-hosted or cloud instance with webhook URL reachable from your VPS |
-| BigQuery | GCP project with the Nostr dataset + service account or OAuth2 credential in n8n |
-| Gemini API | [Google AI Studio](https://aistudio.google.com/) API key (free tier available) |
-| Nostr keys | A bot `nsec` / `npub` pair (see `scripts/generate-keys.js`) |
-| Lightning wallet | For the bot's LNURL-pay endpoint and receiving zaps |
+**Key design decision:** No relay = no running Nostream, no relay maintenance. The bot is just an account (npub) that listens and replies on public relays.
 
 ---
 
-## Quick Start
+## What You Need
+
+| Tool | For | Free Tier? |
+|------|-----|------------|
+| Cloudflare Account | Worker runs here (100k requests/day free) | ✅ |
+| n8n | Workflow engine (cloud or self-hosted) | ✅ (cloud free tier) |
+| Google AI Studio | Gemini API key for NL→SQL | ✅ (1,500 req/day) |
+| BigQuery dataset | Your Nostr data in GCP | — (you already have this) |
+| Lightning wallet | Bot receives zaps | — (any LN wallet with LNURL) |
+
+---
+
+## Setup
 
 ### 1. Generate Bot Keys
 
 ```bash
 node scripts/generate-keys.js
-# Keep the nsec secure. Save the npub — this is what you share.
+# Keep the nsec somewhere safe. Share the npub.
 ```
 
-### 2. Set Up the Bridge
+Then get a Lightning LNURL-pay endpoint for that pubkey so users can zap it. (NIP-57 — most clients generate this automatically when you paste the npub.)
+
+### 2. Deploy the Cloudflare Worker
 
 ```bash
-cd nostr-bridge
-cp .env.example .env
-# Edit .env with your BOT_NSEC, n8n webhook URL, relay URLs
+cd cf-worker-bridge
 npm install
-node bridge.js
+# Set your secrets
+echo "your_hex_private_key" | npx wrangler secret put BOT_NSEC_HEX
+# Update wrangler.toml with your N8N_WEBHOOK_URL, then deploy
+npx wrangler deploy
 ```
 
-The bridge will:
-- Subscribe to DMs (Kind 4) to your bot's pubkey
-- Forward them to `N8N_WEBHOOK_URL`
-- Run an HTTP server on `PORT` (default 3000) with a `/publish` endpoint
+The Worker will:
+- Run every 2 minutes to scan for new DMs + zaps
+- Track zap credits in Cloudflare KV (free tier: 100k/day reads/writes)
+- Expose `POST /publish` for n8n to call back with answers
 
 ### 3. Configure the n8n Workflow
 
-Import `n8n-workflows/query-bot-workflow.json` into your n8n instance.
+Import `n8n-workflows/query-bot-workflow.json` into your n8n instance. Set these credentials in the n8n UI:
 
-**Or build manually** (see [`n8n-workflows/NODE_SETUP.md`](n8n-workflows/NODE_SETUP.md)):
-1. **Webhook** trigger — path `nostr-query`
-2. **Code** node — extract `content` (the query), `pubkey`, and `eventId`
-3. **HTTP Request** — call Gemini with schema context + user query
-4. **Code** node — parse SQL from Gemini's JSON response
-5. **HTTP Request** — call BigQuery `jobs.query` or use the native BigQuery node
-6. **Code** node — format result as a readable reply
-7. **HTTP Request** — POST result to bridge `http://<bridge-host>:3000/publish`
-
-### 4. Update Schema Context
-
-Edit `docs/schema-context.md` to match your actual BigQuery tables. This is sent in every Gemini prompt so it knows which tables exist and their columns.
-
-### 5. Set Price Gate
-
-The **bridge** checks if the user has sent a ≥10,000 sat zap within the last 10 minutes before forwarding the DM. If not, it auto-replies with:
-
-> *"Send a 10,000 sat zap to this account, then send your question."*
-
-You can change the minimum (`MIN_ZAP_MSATS`) and window (`ZAP_WINDOW_MS`) in the bridge `.env`.
-
----
-
-## Workflow Details
-
-### Gemini Prompt Template
-
-The n8n workflow sends a prompt like this to Gemini on every query:
-
-```
-You are a SQL expert for a BigQuery Nostr dataset.
-Available tables:
-{{ $('Read Schema Context').item.json.contents }}
-
-User asked: "{{ $('Extract Query').item.json.query }}"
-
-Write a valid Google BigQuery SQL query to answer this.
-Return ONLY the SQL code inside triple backticks, no explanation.
-```
-
-### BigQuery Execution
-
-- Project: set in `BQ_PROJECT_ID`
-- The SQL is generated by Gemini and then executed via BigQuery `jobs.query`
-- Costs should be minimal for simple aggregations (~100 MB scanned)
-- Set a `MAX_BYTES_BILLED` project limit in GCP as a guardrail
-
----
-
-## Environment Variables
-
-### Bridge (`nostr-bridge/.env`)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `BOT_NSEC` | — | Hex private key for the bot |
-| `RELAYS` | `wss://nos.lol` | Comma-separated relay URLs |
-| `N8N_WEBHOOK_URL` | — | Full URL to n8n webhook trigger |
-| `PORT` | `3000` | Port for bridge publish endpoint |
-| `MIN_ZAP_MSATS` | `10000000` | Minimum zap in millisats (10k sats) |
-| `ZAP_WINDOW_MS` | `600000` | How long zap credit lasts (10 min) |
-
-### n8n Credentials (set in n8n UI)
-
-| Credential | For Node |
-|------------|----------|
+| Credential | Where Used |
+|------------|-----------|
 | `GEMINI_API_KEY` | HTTP Request node → Gemini API |
-| Google Cloud / BigQuery OAuth2 | BigQuery execute node |
+| Google BigQuery OAuth2 | BigQuery SQL execution node |
+
+Set environment variables in n8n:
+- `BQ_PROJECT_ID` — your GCP project
+- `CF_PUBLISH_URL` — `https://<worker-subdomain>.workers.dev/publish`
+
+### 4. Edit Schema Context
+
+Open `docs/schema-context.md` and replace the placeholder table definitions with the actual structure of your BigQuery dataset. This is fed into every Gemini prompt so the LLM knows what columns exist and what queries are valid.
 
 ---
 
-## File Tree
+## File Structure
 
 ```
 nostream-query-bot/
-├── README.md
+├── README.md                           # You're here
+├── docs/
+│   ├── architecture.md                 # Data-flow diagrams, failure modes, security notes
+│   └── schema-context.md              # Table definitions fed to Gemini prompt
 ├── n8n-workflows/
-│   ├── query-bot-workflow.json      # Importable n8n workflow (starter)
-│   └── NODE_SETUP.md                # Step-by-step manual node configuration
-├── nostr-bridge/
-│   ├── bridge.js                    # WebSocket relay listener + publish endpoint
+│   ├── query-bot-workflow.json        # Importable n8n workflow (starter)
+│   └── NODE_SETUP.md                 # Manual node-by-node guide
+├── cf-worker-bridge/                 # ← Cloudflare Worker (replaces old Node.js bridge)
+│   ├── worker.js
+│   ├── wrangler.toml
+│   └── package.json
+├── nostr-bridge/                     # ← Legacy Node.js bridge (kept for reference)
+│   ├── bridge.js
 │   ├── package.json
 │   └── .env.example
-├── docs/
-│   ├── architecture.md
-│   └── schema-context.md            # Table definitions fed into Gemini prompt
 └── scripts/
-    └── generate-keys.js             # Generate bot nsec/npub
+    └── generate-keys.js              # Generates bot nsec/npub pair
 ```
 
----
-
-## Known Limitations / MVP Notes
-
-- **Fixed price only.** No per-query cost estimation yet. If Gemini generates a bad query that scans 200 GB, you eat the cost (hence the GCP `MAX_BYTES_BILLED` guardrail).
-- **Zap verification is relay-trust.** The bridge sees zap receipts from relays. For production, you should cryptographically verify the `preimage` against the invoice (see [NIP-57](https://github.com/nostr-protocol/nips/blob/master/57.md)).
-- **DMs are Kind 4.** For better privacy use NIP-17 (gift-wrapped). Out of scope for MVP.
-- **Bridge runs as a persistent process.** For production, deploy via `pm2`, Docker, or systemd.
-- **Credit is in-memory.** If the bridge restarts, zap credits are lost. Use Redis or SQLite for persistence if needed.
+> **Why both `cf-worker-bridge/` and `nostr-bridge/`?** The `cf-worker-bridge` is the simplified MVP. `nostr-bridge` is the original Node.js implementation — kept as reference if you later want a persistent process for production.
 
 ---
 
-## Next Steps
+## n8n Workflow Nodes (in brief)
 
-1. [ ] Set up test relay (or use Nostream if it's public)
-2. [ ] Run bridge locally, test DM → n8n → reply roundtrip with a mock query
-3. [ ] Connect real BigQuery project and test with actual table
-4. [ ] Tweak Gemini prompt + schema context for accuracy
-5. [ ] Add zap cryptographic verification (NIP-57 preimage check)
-6. [ ] Deploy bridge to your VPS with `pm2` or systemd
+| # | Node | What It Does |
+|---|------|-------------|
+| 1 | **Webhook** | Triggered by the Cloudflare Worker (POST with `{query, pubkey, eventId}`) |
+| 2 | **Code** | Extract user query and pubkey from payload |
+| 3 | **Code** | Build Gemini prompt from `docs/schema-context.md` + user query |
+| 4 | **HTTP Request** | Call Gemini API (`gemini-2.0-flash`) → get SQL |
+| 5 | **Code** | Parse SQL out of Gemini's markdown response |
+| 6 | **HTTP Request** | Execute SQL on BigQuery (`projects/{BQ_PROJECT_ID}/queries`) |
+| 7 | **Code** | Format result rows as a concise text reply |
+| 8 | **HTTP Request** | POST result back to Cloudflare Worker `/publish` endpoint |
+
+Full step-by-step instructions in [`n8n-workflows/NODE_SETUP.md`](n8n-workflows/NODE_SETUP.md).
+
+---
+
+## Pricing Reality Check
+
+| Component | Expected Monthly Cost (light usage) |
+|-----------|-----------------------------------|
+| Cloudflare Worker | **$0** (well under free tier) |
+| Cloudflare KV | **$0** (under free tier for cred tracking) |
+| Gemini API (Google AI Studio) | **$0** (1,500 free requests/day) |
+| BigQuery | **~$0.05–$0.20** (depends on query complexity; simple aggregations cost cents) |
+| n8n (Cloud free tier or self-hosted) | **$0** |
+
+**Bottom line:** This MVP costs almost nothing to run.
+
+---
+
+## Known Gaps (Validation → Production)
+
+| Gap | Why It's Okay for MVP |
+|-----|----------------------|
+| Zap sender not verified cryptographically | Relays could fake receipts. But for a validation test with trusted users, fine. |
+| Credit is global, not per-user | Anyone's zap counts for anyone. Fine for a small test group. |
+| Ordered reply delivery not guaranteed | DMs may drop on relays. Fine for informational queries. |
+| No rate limiting | Could be spammed. Monitor BigQuery costs and set `MAX_BYTES_BILLED`. |
+| NIP-04 DMs are not private | The simplest DM standard. NIP-17 (gift-wrapped) is better but harder. |
+
+If demand is proven, **next iteration** is: per-user verified Ledger + NIP-17 private DMs + rate limiting + per-query cost estimation.
+
+---
+
+## What to Test First
+
+1. [ ] Set up a test Nostr account (using `generate-keys.js`), fund it with 10k sats via a lightning wallet
+2. [ ] Deploy the Worker and configure the n8n workflow
+3. [ ] Send a DM from the test account — watch the Worker log, check n8n execution, get reply
+4. [ ] If the reply works, invite 3–5 beta testers
+5. [ ] If no one pays for queries after a week, you didn't need to build anything bigger. That's a win.
 
 ---
 

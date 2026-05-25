@@ -1,0 +1,14 @@
+name = "nostream-query-bot"
+main = "worker.js"
+compatibility_date = "2024-12-01"
+
+# Cron schedule: run every 2 minutes to check for new events
+[triggers]
+crons = ["*/2 * * * *"]
+
+[vars]
+RELAYS = "wss://nos.lol,wss://relay.damus.io,wss://nostr.mom"
+N8N_WEBHOOK_URL = ""
+
+# Secrets (set via `wrangler secret put`):
+# BOT_NSEC_HEX
